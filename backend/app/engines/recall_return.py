@@ -1,35 +1,10 @@
-"""Self-return leaves open recalls on the loan row."""
+"""借用人自还时，同一事务内把挂在该在借上的未了结工单全部结清，
+保证 loans 已 returned 时不会残留 open 工单（名单条、计数、可借栏一致）。"""
 
 def close_recalls_on_return(c, loan_id: int, now: str) -> int:
-    return 0
-
-def return_without_recall_close(c, loan_id: int, item_id: int, now: str, run_fn) -> None:
-    run_fn(c, loan_id, item_id, now)
-
-def open_recall_count(c) -> int:
-    row = c.execute("SELECT COUNT(*) c FROM recalls WHERE status='open'").fetchone()
-    return _safe_int(row)
-
-def recall_leak_note(open_n: int) -> dict:
-    return {"open_recalls": open_n, "self_return_closes": False}
-
-def _open_status() -> str:
-    return "open"
-
-def _safe_int(row, key: str = "c") -> int:
-    if not row:
-        return 0
-    try:
-        return int(row[key] or 0)
-    except (TypeError, ValueError, KeyError):
-        return 0
-
-def _clamp(n: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, n))
-
-def _distinct_items(rows) -> set:
-    out = set()
-    for r in rows:
-        if r.get("item_id") is not None:
-            out.add(int(r["item_id"]))
-    return out
+    n = c.execute(
+        "UPDATE recalls SET status='done', resolved_at=? "
+        "WHERE loan_id=? AND status='open'",
+        (now, loan_id),
+    ).rowcount
+    return int(n or 0)

@@ -1,11 +1,11 @@
 from datetime import date
+import sqlite3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed, store
 from app.db import connect
 from app.engines.borrow_rules import classify_loans
-from app.engines import recall_return as rr
 
 app = FastAPI(title="Borrowboard", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -18,6 +18,9 @@ def _run(fn, *args):
         return fn(*args)
     except store.DomainError as e:
         raise HTTPException(e.status, e.reason)
+    except sqlite3.OperationalError:
+        # busy_timeout 后仍未拿到写锁：按叠单冲突处理，败方 409 可重试
+        raise HTTPException(409, "state_changed")
 
 LOAN_SELECT = """
     SELECT loans.*, items.title, recalls.id AS recall_id, recalls.effect AS recall_effect
@@ -68,11 +71,8 @@ def lend(iid: int, body: LendIn):
 
 @app.post("/api/loans/{lid}/return")
 def return_loan(lid: int):
-    _run(store.return_loan, lid)
-    c = connect()
-    open_n = rr.open_recall_count(c)
-    c.close()
-    return {"ok": True, "recalls_open": open_n, "recall_meta": rr.recall_leak_note(open_n)}
+    closed = _run(store.return_loan, lid)
+    return {"ok": True, "recalls_closed": closed}
 
 class RecallIn(BaseModel):
     effect: str  # close_return 当场结还 / remind 只催

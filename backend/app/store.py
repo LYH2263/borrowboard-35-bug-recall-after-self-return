@@ -2,6 +2,7 @@
 guarded UPDATEs (rowcount checked) so racing confirm / return / cancel / overdue-scan
 reads can only ever produce one loans.status outcome."""
 import sqlite3
+import time
 from datetime import datetime, timezone
 from app.db import connect
 from app.engines.borrow_rules import (
@@ -18,10 +19,31 @@ class DomainError(Exception):
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _begin_immediate(c) -> None:
+    """开启写事务并在锁冲突时有界重试。
+
+    WAL 下连接频繁开合时，新连接可能要先做 WAL 恢复（需要排他锁），
+    该路径 SQLite 不触发 busy handler、会立刻 SQLITE_BUSY；叠单时
+    （确认 / 撤回 / 自还同时点下）后到者必须排队进事务，再由守卫
+    UPDATE 判定成败，而不是直接把 500 抛给用户。只在事务起点重试：
+    此刻尚无语句执行，重试无副作用。
+    """
+    deadline = time.monotonic() + 10.0
+    delay = 0.02
+    while True:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
+
 def lend_item(item_id: int, borrower: str, due_date: str) -> int:
     c = connect()
     try:
-        c.execute("BEGIN IMMEDIATE")
+        _begin_immediate(c)
         item = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
         if not item:
             raise DomainError("item", 404)
@@ -41,10 +63,12 @@ def lend_item(item_id: int, borrower: str, due_date: str) -> int:
     finally:
         c.close()
 
-def return_loan(loan_id: int) -> None:
+def return_loan(loan_id: int) -> int:
+    """借用人自还：借行置 returned、物品回可借栏、挂账工单同事务结清。
+    返回本次结清的未了结工单数。"""
     c = connect()
     try:
-        c.execute("BEGIN IMMEDIATE")
+        _begin_immediate(c)
         loan = c.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
         if not loan:
             raise DomainError("loan", 404)
@@ -52,9 +76,10 @@ def return_loan(loan_id: int) -> None:
                       (_now(), loan_id)).rowcount
         if n != 1:
             raise DomainError("not_active", 400)
-        c.execute("UPDATE items SET status='available' WHERE id=? AND status='on_loan'", (loan["item_id"],))
-        rr.close_recalls_on_return(c, loan_id, _now())
+        c.execute("UPDATE items SET status='available' WHERE id=?", (loan["item_id"],))
+        closed = rr.close_recalls_on_return(c, loan_id, _now())
         c.commit()
+        return closed
     except DomainError:
         c.rollback(); raise
     finally:
@@ -66,7 +91,7 @@ def initiate_recall(loan_id: int, effect: str) -> int:
         raise DomainError(check["reason"], 400)
     c = connect()
     try:
-        c.execute("BEGIN IMMEDIATE")
+        _begin_immediate(c)
         loan = c.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone()
         if not loan:
             raise DomainError("loan", 404)
@@ -92,7 +117,7 @@ def initiate_recall(loan_id: int, effect: str) -> int:
 def confirm_recall(recall_id: int) -> str:
     c = connect()
     try:
-        c.execute("BEGIN IMMEDIATE")
+        _begin_immediate(c)
         r = c.execute("SELECT * FROM recalls WHERE id=?", (recall_id,)).fetchone()
         if not r:
             raise DomainError("recall", 404)
@@ -109,7 +134,7 @@ def confirm_recall(recall_id: int) -> str:
                           (_now(), r["loan_id"])).rowcount
             if n != 1:
                 raise DomainError("loan_not_active")
-            c.execute("UPDATE items SET status='available' WHERE id=? AND status='on_loan'", (r["item_id"],))
+            c.execute("UPDATE items SET status='available' WHERE id=?", (r["item_id"],))
         # 只催：在借行与物品状态不动，等借用人自还
         c.commit()
         return r["effect"]
@@ -121,7 +146,7 @@ def confirm_recall(recall_id: int) -> str:
 def cancel_recall(recall_id: int) -> None:
     c = connect()
     try:
-        c.execute("BEGIN IMMEDIATE")
+        _begin_immediate(c)
         r = c.execute("SELECT * FROM recalls WHERE id=?", (recall_id,)).fetchone()
         if not r:
             raise DomainError("recall", 404)

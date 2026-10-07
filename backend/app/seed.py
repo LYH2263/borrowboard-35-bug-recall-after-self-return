@@ -1,7 +1,8 @@
-from app.db import connect
+from app.db import connect, enable_wal
 
 def init_db():
     c = connect()
+    enable_wal(c)
     c.executescript("""
     CREATE TABLE IF NOT EXISTS items(
       id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, owner TEXT, status TEXT, data_quality TEXT

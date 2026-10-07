@@ -19,6 +19,5 @@
 import { ref, onMounted } from 'vue'
 import { api } from '../api'
 const data = ref({ active: [], overdue: [], returned: [] })
-const recallLeak = ref(true)
 onMounted(async () => { data.value = await api('/loans') })
 </script>
