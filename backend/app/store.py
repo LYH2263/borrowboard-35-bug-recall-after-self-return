@@ -27,7 +27,9 @@ def lend_item(item_id: int, borrower: str, due_date: str) -> int:
             raise DomainError("item", 404)
         active = c.execute(
             "SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (item_id,)).fetchone()["c"]
-        check = can_lend(item["status"], active)
+        open_recalls = c.execute(
+            "SELECT COUNT(*) c FROM recalls WHERE item_id=? AND status='open'", (item_id,)).fetchone()["c"]
+        check = can_lend(item["status"], active, open_recalls)
         if not check["ok"]:
             raise DomainError(check["reason"])
         cur = c.execute(
@@ -99,18 +101,24 @@ def confirm_recall(recall_id: int) -> str:
         check = can_resolve_recall(r["status"])
         if not check["ok"]:
             raise DomainError(check["reason"])
+        if r["effect"] == "close_return":
+            # 先翻贷款：与借用人自还撞车时，守卫 UPDATE 保证 loans.status 只被翻一次
+            n = c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=? AND status='active'",
+                          (_now(), r["loan_id"])).rowcount
+            if n == 1:
+                c.execute("UPDATE items SET status='available' WHERE id=? AND status='on_loan'", (r["item_id"],))
+            else:
+                # 借用人已自还：贷款应已是 returned（自还同时关掉本单）。
+                # 兼容历史脏状态——贷款 returned 而工单仍 open 时，照常把工单了结，不卡死名单。
+                cur = c.execute("SELECT status FROM loans WHERE id=?", (r["loan_id"],)).fetchone()
+                if not cur or cur["status"] != "returned":
+                    raise DomainError("loan_not_active")
+        # 只催：在借行与物品状态不动，等借用人自还。
+        # 最后才翻工单：前面任一步失败回滚后，工单仍 open、贷款仍 active，不留半截名单。
         n = c.execute("UPDATE recalls SET status='done', resolved_at=? WHERE id=? AND status='open'",
                       (_now(), recall_id)).rowcount
         if n != 1:
             raise DomainError("recall_not_open")
-        if r["effect"] == "close_return":
-            # 当场结还：与借用人归还撞车时只有一方能翻转 loans.status
-            n = c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=? AND status='active'",
-                          (_now(), r["loan_id"])).rowcount
-            if n != 1:
-                raise DomainError("loan_not_active")
-            c.execute("UPDATE items SET status='available' WHERE id=? AND status='on_loan'", (r["item_id"],))
-        # 只催：在借行与物品状态不动，等借用人自还
         c.commit()
         return r["effect"]
     except DomainError:

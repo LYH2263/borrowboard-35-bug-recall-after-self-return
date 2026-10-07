@@ -2,11 +2,14 @@
 
 RECALL_EFFECTS = ("close_return", "remind")  # 当场结还 / 只催
 
-def can_lend(item_status: str, active_loans: int) -> dict:
+def can_lend(item_status: str, active_loans: int, open_recalls: int = 0) -> dict:
     if item_status != "available":
         return {"ok": False, "reason": "item_not_available"}
     if active_loans > 0:
         return {"ok": False, "reason": "already_on_loan"}
+    if open_recalls > 0:
+        # 未了结催还名单在：即便物品状态已被脏数据放成 available 也不许再借
+        return {"ok": False, "reason": "recall_open"}
     return {"ok": True, "reason": ""}
 
 def is_overdue(due_date: str, today: str, loan_status: str) -> bool:
